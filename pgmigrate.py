@@ -108,7 +108,7 @@ def _init_cursor(conn, session):
     return cursor
 
 
-def _is_initialized(cursor):
+def _is_initialized(cursor, schema='public'):
     '''
     Check that database is initialized
     '''
@@ -116,14 +116,14 @@ def _is_initialized(cursor):
                            'information_schema.tables '
                            'WHERE table_schema = %s '
                            'AND table_name = %s);',
-                           ('public', 'schema_version'))
+                           (schema, 'schema_version'))
     cursor.execute(query)
     table_exists = cursor.fetchone()[0]
 
     if not table_exists:
         return False
 
-    cursor.execute('SELECT * from public.schema_version limit 1;')
+    cursor.execute('SELECT * from ' + schema + '.schema_version limit 1;')
 
     colnames = [desc[0] for desc in cursor.description]
 
@@ -145,7 +145,7 @@ Callbacks = namedtuple('Callbacks', ('beforeAll', 'beforeEach',
                                      'afterEach', 'afterAll'))
 
 Config = namedtuple('Config', ('target', 'baseline', 'cursor', 'dryrun',
-                               'callbacks', 'user', 'base_dir', 'conn',
+                               'callbacks', 'user', 'base_dir', 'conn', 'schema',
                                'session', 'conn_instance'))
 
 CONFIG_IGNORE = ['cursor', 'conn_instance']
@@ -206,13 +206,13 @@ def _get_migrations_info(base_dir, baseline_v, target_v):
     return migrations
 
 
-def _get_info(base_dir, baseline_v, target_v, cursor):
+def _get_info(base_dir, baseline_v, target_v, cursor, schema='public'):
     '''
     Get migrations info from database and base dir
     '''
     ret = {}
     cursor.execute('SELECT ' + ', '.join(REF_COLUMNS) +
-                   ' from public.schema_version;')
+                   ' from ' + schema + '.schema_version;')
 
     for i in cursor.fetchall():
         version = {}
@@ -242,21 +242,21 @@ def _get_database_user(cursor):
     return cursor.fetchone()[0]
 
 
-def _get_state(base_dir, baseline_v, target, cursor):
+def _get_state(base_dir, baseline_v, target, cursor, schema='public'):
     '''
     Get info wrapper (able to handle noninitialized database)
     '''
-    if _is_initialized(cursor):
-        return _get_info(base_dir, baseline_v, target, cursor)
+    if _is_initialized(cursor, schema):
+        return _get_info(base_dir, baseline_v, target, cursor, schema)
     else:
         return _get_migrations_info(base_dir, baseline_v, target)
 
 
-def _set_baseline(baseline_v, user, cursor):
+def _set_baseline(baseline_v, user, cursor, schema='public'):
     '''
     Cleanup schema_version and set baseline
     '''
-    query = cursor.mogrify('SELECT EXISTS(SELECT 1 FROM public'
+    query = cursor.mogrify('SELECT EXISTS(SELECT 1 FROM ' + schema,
                            '.schema_version WHERE version >= %s::bigint);',
                            (baseline_v,))
     cursor.execute(query)
@@ -267,11 +267,11 @@ def _set_baseline(baseline_v, user, cursor):
                             '%s already applied' % text(baseline_v))
 
     LOG.info('cleaning up table schema_version')
-    cursor.execute('DELETE FROM public.schema_version;')
+    cursor.execute('DELETE FROM ' + schema + '.schema_version;')
     LOG.info(cursor.statusmessage)
 
     LOG.info('setting baseline')
-    query = cursor.mogrify('INSERT INTO public.schema_version '
+    query = cursor.mogrify('INSERT INTO ' + schema + '.schema_version '
                            '(version, type, description, installed_by) '
                            'VALUES (%s::bigint, %s, %s, %s);',
                            (text(baseline_v), 'manual',
@@ -280,20 +280,24 @@ def _set_baseline(baseline_v, user, cursor):
     LOG.info(cursor.statusmessage)
 
 
-def _init_schema(cursor):
+def _init_schema(cursor, schema='public'):
     '''
     Create schema_version table
     '''
+    LOG.info('creating schema')
+    cursor.execute('CREATE SCHEMA ' + schema + ' ;')
+    LOG.info(cursor.statusmessage)
+
     LOG.info('creating type schema_version_type')
-    query = cursor.mogrify('CREATE TYPE public.schema_version_type '
+    query = cursor.mogrify('CREATE TYPE ' + schema + '.schema_version_type '
                            'AS ENUM (%s, %s);', ('auto', 'manual'))
     cursor.execute(query)
     LOG.info(cursor.statusmessage)
     LOG.info('creating table schema_version')
-    query = cursor.mogrify('CREATE TABLE public.schema_version ('
+    query = cursor.mogrify('CREATE TABLE ' + schema + '.schema_version ('
                            'version BIGINT NOT NULL PRIMARY KEY, '
                            'description TEXT NOT NULL, '
-                           'type public.schema_version_type NOT NULL '
+                           'type ' + schema + '.schema_version_type NOT NULL '
                            'DEFAULT %s, '
                            'installed_by TEXT NOT NULL, '
                            'installed_on TIMESTAMP WITHOUT time ZONE '
@@ -348,7 +352,7 @@ def _apply_file(file_path, cursor):
         raise exc
 
 
-def _apply_version(version, base_dir, user, cursor):
+def _apply_version(version, base_dir, user, cursor, schema='public'):
     '''
     Execute all statements in migration version
     '''
@@ -357,7 +361,7 @@ def _apply_version(version, base_dir, user, cursor):
     LOG.info('Try apply version %r', version_info)
 
     _apply_file(version_info.filePath, cursor)
-    query = cursor.mogrify('INSERT INTO public.schema_version '
+    query = cursor.mogrify('INSERT INTO ' + schema + '.schema_version '
                            '(version, description, installed_by) '
                            'VALUES (%s::bigint, %s, %s)',
                            (text(version),
@@ -419,15 +423,15 @@ def _get_callbacks(callbacks, base_dir=''):
         return _parse_str_callbacks(callbacks, ret, base_dir)
 
 
-def _migrate_step(state, callbacks, base_dir, user, cursor):
+def _migrate_step(state, callbacks, base_dir, user, cursor, schema='public'):
     '''
     Apply one version with callbacks
     '''
     before_all_executed = False
     should_migrate = False
-    if not _is_initialized(cursor):
+    if not _is_initialized(cursor, schema):
         LOG.info('schema not initialized')
-        _init_schema(cursor)
+        _init_schema(cursor, schema)
     for version in sorted(state.keys()):
         LOG.debug('has version %r', version)
         if state[version]['installed_on'] is None:
@@ -446,7 +450,7 @@ def _migrate_step(state, callbacks, base_dir, user, cursor):
                     LOG.info(callback)
                     _apply_file(callback, cursor)
 
-            _apply_version(version, base_dir, user, cursor)
+            _apply_version(version, base_dir, user, cursor, schema)
 
             if callbacks.afterEach:
                 LOG.info('Executing afterEach callbacks:')
@@ -473,7 +477,7 @@ def info(config, stdout=True):
     Info cmdline wrapper
     '''
     state = _get_state(config.base_dir, config.baseline,
-                       config.target, config.cursor)
+                       config.target, config.cursor, config.schema)
     if stdout:
         out_state = OrderedDict()
         for version in sorted(state, key=int):
@@ -490,12 +494,12 @@ def clean(config):
     '''
     Drop schema_version table
     '''
-    if _is_initialized(config.cursor):
+    if _is_initialized(config.cursor, config.schema):
         LOG.info('dropping schema_version')
-        config.cursor.execute('DROP TABLE public.schema_version;')
+        config.cursor.execute('DROP TABLE ' + config.schema + '.schema_version;')
         LOG.info(config.cursor.statusmessage)
         LOG.info('dropping schema_version_type')
-        config.cursor.execute('DROP TYPE public.schema_version_type;')
+        config.cursor.execute('DROP TYPE ' + config.schema + '.schema_version_type;')
         LOG.info(config.cursor.statusmessage)
         _finish(config)
 
@@ -504,9 +508,9 @@ def baseline(config):
     '''
     Set baseline cmdline wrapper
     '''
-    if not _is_initialized(config.cursor):
-        _init_schema(config.cursor)
-    _set_baseline(config.baseline, config.user, config.cursor)
+    if not _is_initialized(config.cursor, config.schema):
+        _init_schema(config.cursor, config.schema)
+    _set_baseline(config.baseline, config.user, config.cursor, config.schema)
 
     _finish(config)
 
@@ -561,7 +565,7 @@ def migrate(config):
         raise MigrateError('Unknown target')
 
     state = _get_state(config.base_dir, config.baseline,
-                       config.target, config.cursor)
+                       config.target, config.cursor, config.schema)
     not_applied = [x for x in state if state[x]['installed_on'] is None]
     non_trans = [x for x in not_applied if not state[x]['transactional']]
 
@@ -582,7 +586,7 @@ def migrate(config):
             nt_conn.autocommit = True
             cursor = _init_cursor(nt_conn, config.session)
             _migrate_step(state, _get_callbacks(''),
-                          config.base_dir, config.user, cursor)
+                          config.base_dir, config.user, cursor, config.schema)
         else:
             steps = _prepare_nontransactional_steps(state, config.callbacks)
 
@@ -600,10 +604,10 @@ def migrate(config):
                     cur = config.cursor
                     commit_req = True
                 _migrate_step(step['state'], step['cbs'],
-                              config.base_dir, config.user, cur)
+                              config.base_dir, config.user, cur, config.schema)
     else:
         _migrate_step(state, config.callbacks, config.base_dir,
-                      config.user, config.cursor)
+                      config.user, config.cursor, config.schema)
 
     _finish(config)
 
@@ -620,6 +624,7 @@ CONFIG_DEFAULTS = Config(target=None, baseline=0, cursor=None, dryrun=False,
                          session=['SET lock_timeout = 0'],
                          conn='dbname=postgres user=postgres '
                               'connect_timeout=1',
+                         schema='public',
                          conn_instance=None)
 
 
@@ -702,6 +707,10 @@ def _main():
                         default=0,
                         action='count',
                         help='Be verbose')
+    parser.add_argument('-m', '--schema',
+                        type=str,
+                        help='Migrations db schema name')
+
 
     args = parser.parse_args()
     logging.basicConfig(
